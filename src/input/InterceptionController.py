@@ -294,3 +294,20 @@ def mouse_position():
     """返回当前鼠标的屏幕绝对坐标 (x, y)"""
     _ensure_mouse_ready()
     return interception.mouse_position()
+
+
+def mouse_hold(button="left", down=True):
+    """按下/松开鼠标键不配对（供需要**按住**的场景，如测谎跟随验证）。
+
+    与 click_at 的区别：click 是"按下立刻松开"的完整点击；本函数只做
+    其中一半，调用方自己保证 down=True 的那侧最终会 down=False 收尾
+    （测谎守卫的 _release_hold / 异常退路都在做这件事）。
+    """
+    _ensure_mouse_ready()
+    if button not in ("left", "right", "middle", "mouse4", "mouse5"):
+        logger.warning(f"[Interception mouse_hold] 不支持的按键: {button}，回退为 left")
+        button = "left"
+    if down:
+        interception.mouse_down(button)
+    else:
+        interception.mouse_up(button)

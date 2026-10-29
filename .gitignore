@@ -60,3 +60,7 @@ minimaps/*
 monster/*
 !monster/.gitkeep
 
+
+# 测谎仪模板（真机截图切的个人素材；出厂目录为空，工具会生成）
+lie_detector/*
+!lie_detector/.gitkeep

@@ -112,6 +112,8 @@ Windows 有两套发按键的路子：
 | 反作弊 | — | 客户端带**反挂机（AntiMacro）验证**与三层反作弊 |
 | **按键模拟** | **KMbox 硬件外设**（需额外购买） | **Interception 软件驱动**（开源免费，[说明见上](#driver)） |
 | **自动喝药** | 宠物技能 / 手动 | **血蓝监控自动喝药**（识屏读血条，环境锁定 1366x768 窗口化） |
+| **攻击模式** | 单体 / 群体 二选一 | 增加 **auto 智能切换**：怪多（≥2，可调）自动放群体技能、怪少用单体 —— 单体省蓝、群体清怪快（2026-10-29 加，界面下拉「智能切换」） |
+| **反挂机应对** | — | **测谎仪自动应答**（星星跟随版，见下文专节） |
 
 ## 环境要求
 
@@ -252,6 +254,40 @@ gh release upload vX.Y.Z MapleStoryAutoLevelUp-CN-vX.Y.Z.zip patch-to-vX.Y.Z-uni
 补丁**不会包含**用户自己的数据：`config/config_custom.yaml`、`config/config_data.yaml`、`log/`、`minimaps/`、`monster/`、`nametag/` 一律排除，覆盖升级不会毁掉配置和路线。
 
 
+## 🧩 功能开关（勾什么跑什么，2026-10-29 加）
+
+主界面「开始」按钮正下方有一排勾选框，**勾了才跑对应功能，运行中随时切换（下一帧生效，不必停挂机）**：
+
+| 勾选框 | 控制什么 | 关掉的效果 |
+|---|---|---|
+| 移动（巡逻走位） | 沿录好的路线来回走 | 角色站定不动（卡死告警也停 —— 站着是故意的） |
+| 攻击（打怪） | 识别怪物放技能 | 只走位不打怪 |
+| 增益技能（buff） | 按冷却自动放 buff | 不自动放 |
+| 自动拾取 | 按拾取键捡东西 | 不自动捡 |
+
+喝药和测谎不在这排里：喝药在「自动喝药」组有自己的开关（阈值那一套跟着它走）；测谎用 `lie_detector.enabled`（模板没做时勾了也不生效）。勾选状态会随配置方案一起保存。
+
+## 自动过测谎仪（2026-10-29 加，星星跟随版）
+
+怀旧服的「谎言探测仪」是玩家互相举报用的限时验证弹窗 —— 挂机最怕它（人在睡觉没人管）。题型（真机截图确认）：弹窗先显示「1 秒后测谎小游戏开始」的预告页，然后整体切换成星星场地 —— **散布着很多五角星，其中目标星会逐渐透明且移动，鼠标要悬停跟随它**（按光标位于图形上的时间累计判定，不用点击不用按键）；星星彻底消失 = 验证失败。
+
+本工具的应对（`src/utils/lie_detector.py`）：
+
+- **做法与全项目一致**：只看画面、只动鼠标 —— 模板匹配检测弹窗 → **帧差法**找目标星（背景星星是静态贴图帧差恒为零；目标星在变透明/移动，帧间必有差异。基线差分 + 相邻差分互补，渐隐快慢都能锁住；预告页→星星场地的**整幅切换**有专门防御，不会把满屏变化误当目标）→ 每 0.1s 鼠标贴上去跟着走（带 ±2px 拟人抖动）；
+- **定位失败绝不乱指鼠标**：弹窗里毫无变化 / 跟随超时，就弹**置顶窗口把人叫醒**，挂机静默等你处理，弹窗消失后自动恢复；
+- 弹窗出现瞬间停掉一切打怪/移动/buff/拾取按键（防误点弹窗），唯一保留自动喝药（弹窗不挡怪物攻击，低血挂机遇测谎会被打死）。
+
+**使用前提：先做一次模板**（出厂为空，`lie_detector/` 目录）：
+
+```bash
+# 1. 找朋友（或小号）对你用一次测谎仪，趁弹窗开着截一张整窗截图（含标题栏）
+# 2. 制作模板（窗口里框两下：弹窗特征 + 星星活动区，两分钟搞定）
+python -m tools.make_lie_detector_templates --image 截图.png
+# 3. 重启挂机，日志看到「[测谎] 守卫就绪」即生效
+```
+
+模板不全时功能自动跳过（日志提示缺什么），不影响其它功能。参数（跟随频率/超时/是否按住左键等）见 `config/config_default.yaml` 的 `lie_detector` 段。
+
 ## 配置体系
 
 - `config/config_default.yaml` —— 全部默认值与注释说明（**基准**，一般不改）
@@ -268,6 +304,7 @@ gh release upload vX.Y.Z MapleStoryAutoLevelUp-CN-vX.Y.Z.zip patch-to-vX.Y.Z-uni
 | 路线录制 | `python -m tools.routeRecorder --new_map <地图目录名>` | 录制巡逻路线与回正线 |
 | 怪物模板 | `python tools/mob_maker.py` | 从 maplestory.io 下载怪物图（注意：**上游数据，国服不一定通用**） |
 | 名字标定 | `python -m tools.calibrate_nametag` | 标定角色名标签模板 |
+| 测谎模板 | `python -m tools.make_lie_detector_templates --image 截图.png` | 制作测谎仪自动应答的模板（弹窗特征 + 字符 + 题目区，做一次即可） |
 | 模板查重 | `python -m tools.mob_template_qa` | 检查怪物模板是否重复 |
 | 诊断包 | `python -m tools.diagnose` | 收集环境与日志用于排查 |
 
@@ -292,6 +329,8 @@ python -m tools.verify_navigation         # 导航与路线
 python -m tools.verify_home_route         # 回正线
 python -m tools.verify_recorder_action    # 录制器动作读取
 python -m tools.verify_bars_potions       # 血蓝监控 + 自动喝药（含"不在前台不发键"回归）
+python -m tools.verify_pickup             # 自动拾取（冷却抖动 / 计数 / UI 接线）
+python -m tools.verify_lie_detector       # 测谎仪自动应答（合成帧全链路 + 失败降级）
 python -m tools.verify_ci_green_check     # 发版门禁的判据本身（离线，不联网）
 ```
 

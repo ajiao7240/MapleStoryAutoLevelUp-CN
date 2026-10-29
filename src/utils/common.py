@@ -1418,3 +1418,21 @@ def monster_detect_interval(cfg) -> int:
     except (AttributeError, TypeError, ValueError):
         return 1
     return n if n >= 1 else 1
+
+
+def feature_enabled(cfg, name, default=True):
+    '''功能开关读取（2026-10-29 加，config 的 features 段）。
+
+    用途：界面上的「🧩 功能开关」勾选框 —— 勾了才跑对应功能
+    （移动 / 攻击 / buff / 拾取），运行中可随时切、下一帧生效。
+
+    · 段缺失 / 键缺失 → default（出厂全开，老配置行为零变化）；
+    · 布尔原样返回；字符串做宽松解析（"false"/"off"/"0"/"no" = 关），
+      防手改配置写错类型时把开关判反。
+    纯函数：引擎主循环、键盘线程、离线自检共用同一判据。
+    '''
+    sec = (cfg.get("features") or {}) if isinstance(cfg, dict) else {}
+    v = sec.get(name, default)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "off", "no")
+    return bool(v)

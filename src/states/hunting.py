@@ -12,16 +12,33 @@ class HuntingState(State):
         return None
 
     def on_frame(self):
-        # 指令来源按挂机方式分派：
-        # 2026-09-12：定点模式（stand）已按用户要求删除 —— 站着不动的收益
-        # 不如"来回走两步顺便打怪"，统一走巡逻。指令来源只剩路线一条。
-        self.bot.update_cmd_by_route()
+        # 🧩 功能开关（2026-10-29 加，界面「功能开关」勾选框）：
+        # 不勾的功能**整段跳过**，且必须把该功能残留的指令清掉 ——
+        # cmd_* 是跨帧保持的实例属性，只跳过不清 = 关掉移动角色还在走
+        # （跟 2026-09-12 修的「没怪还打空气」是同一类坑，别再踩）。
+        #
+        # ⚠️ 关掉移动时同时跳过卡死检测：角色是**用户故意**让它站着
+        #（比如只挂 buff / 只喝药），不是卡住 —— 看门狗每 10s 弹一次
+        # 置顶告警会把人烦死。
+        move_on = self.bot.feature_on("move")
+        if move_on:
+            # 指令来源按挂机方式分派：
+            # 2026-09-12：定点模式（stand）已按用户要求删除 —— 站着不动的收益
+            # 不如"来回走两步顺便打怪"，统一走巡逻。指令来源只剩路线一条。
+            self.bot.update_cmd_by_route()
 
-        # Check if reach goal on route map
-        self.bot.check_reach_goal()
+            # Check if reach goal on route map
+            self.bot.check_reach_goal()
+        else:
+            self.bot.cmd_move_x = 'none'
+            self.bot.cmd_move_y = 'none'
 
         # Get attack commend by detecting mobs near players
-        self.bot.update_cmd_by_mob_detection()
+        if self.bot.feature_on("attack"):
+            self.bot.update_cmd_by_mob_detection()
+        else:
+            if self.bot.cmd_action in ("attack", "attack_aoe"):
+                self.bot.cmd_action = 'none'
 
         # 卡死处理（2026-09-15 改）
         # 原来固定调 update_cmd_by_random（12 种组合**均匀乱抽**，不知道悬崖在哪）：
@@ -29,7 +46,7 @@ class HuntingState(State):
         # ② 它把真因**盖住**了（随机跳把角色从 (100,122) 踹到 (100,118)，
         #    症状从"在原地蹭"变成"跳到另一层"，日志上看"它动了"，更难查）。
         # 现在按 config 的 watchdog.on_stuck 分派，默认 alert = **不乱动 + 弹置顶提示**。
-        if self.bot.is_player_stuck():
+        if move_on and self.bot.is_player_stuck():
             self.bot.handle_stuck()
 
         # send command to keyboard controller

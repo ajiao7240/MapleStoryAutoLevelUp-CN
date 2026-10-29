@@ -863,6 +863,11 @@ class MainWindow(QMainWindow):
         self.control_gbox = self.create_control_gbox()
         scroll_layout.addWidget(self.control_gbox)
 
+        # 🧩 功能开关（2026-10-29 加）—— 紧跟开始按钮：勾什么跑什么，
+        # 运行中随时勾/取消，下一帧生效（不必停挂机）
+        self.features_gbox = self.create_features_gbox()
+        scroll_layout.addWidget(self.features_gbox)
+
         # Attack setting group box
         self.attack_gbox = self.create_attack_gbox()
         scroll_layout.addWidget(self.attack_gbox)
@@ -1280,9 +1285,13 @@ class MainWindow(QMainWindow):
         # Left column
         form_left = QFormLayout()
         self.attack_mode = QComboBox()
-        self.attack_mode.addItems(["基础攻击", "AOE技能"])
+        # 🆕 2026-10-29 加「智能切换」（auto）：怪多自动用群体技能、怪少用单体，
+        #    两个键都会用到（基础攻击键 + 群体技能键）。阈值在配置
+        #    auto_attack.aoe_min_mobs（界面不暴露，默认 2）。
+        self.attack_mode.addItems(["基础攻击", "AOE技能", "智能切换"])
         self.attack_mode.setItemData(0, "directional")
         self.attack_mode.setItemData(1, "aoe_skill")
+        self.attack_mode.setItemData(2, "auto")
         self.attack_mode.setFixedWidth(100)
 
         # Connect dropdown change to handler
@@ -1914,6 +1923,51 @@ class MainWindow(QMainWindow):
 
         return gbox
 
+    # ── 🧩 功能开关（2026-10-29 加）────────────────────────────────────
+    #: 勾选框 ↔ 配置键 ↔ 给用户看的说明。顺序即界面顺序。
+    FEATURE_ITEMS = [
+        ("move",   "移动（巡逻走位）", "沿录好的路线来回走。关掉 = 角色站定不动\n（只挂 buff/喝药/测谎时会用到）。"),
+        ("attack", "攻击（打怪）",     "识别怪物放技能（攻击模式见「攻击设置」）。\n关掉 = 只走位不打怪。"),
+        ("buff",   "增益技能（buff）", "按「增益技能」组里配的键和冷却自动放。\n关掉 = 不自动放 buff。"),
+        ("pickup", "自动拾取",         "按「自动拾取」组里配的键捡东西。\n关掉 = 不自动捡（键留空同样是不捡）。"),
+    ]
+
+    def create_features_gbox(self):
+        '''
+        🧩 功能开关组：勾什么跑什么。
+
+        · 勾选状态会写进配置的 features 段（保存方案时一起存）；
+        · 运行中勾/取消**立即生效**（on_feature_toggled → bot.set_feature，
+          引擎下一帧读新值），不必停挂机；
+        · 喝药/测谎不在这里：喝药在「自动喝药」组有自己的开关（阈值那一套
+          跟着它），测谎在配置 lie_detector.enabled（模板没做时勾了也不生效，
+          放配置里更合适）。
+        '''
+        gbox = QGroupBox("🧩 功能开关（勾了才跑，运行中可随时切换）")
+        layout = QHBoxLayout()
+        layout.setSpacing(16)
+        self._feature_cbs = {}
+        for name, label, tip in self.FEATURE_ITEMS:
+            cb = QCheckBox(label)
+            cb.setToolTip(tip)
+            cb.setChecked(True)          # 默认全开（apply_config_to_ui 会按配置纠正）
+            cb.toggled.connect(
+                lambda checked, n=name: self.on_feature_toggled(n, checked))
+            layout.addWidget(cb)
+            self._feature_cbs[name] = cb
+        layout.addStretch(1)
+        gbox.setLayout(layout)
+        return gbox
+
+    def on_feature_toggled(self, name, checked):
+        '''功能开关热切换：立刻作用到正在跑的引擎（不必停挂机）。'''
+        try:
+            self.controller.auto_bot.set_feature(name, checked)
+        except Exception as e:                                   # noqa: BLE001
+            # 引擎还没起来（没点过开始）时这里会失败 —— 与 on_potion_toggled
+            # 同一个口径：状态已写进 self.cfg（保存方案时会落盘），不算错误
+            logger.debug(f"[功能开关] {name} 暂时没送到引擎（多半还没开始挂机）：{e}")
+
     def create_control_gbox(self):
         '''
         Creates a group box with hotkey instructions and a dropdown to select mode
@@ -2358,7 +2412,10 @@ class MainWindow(QMainWindow):
         elif index == 1:
             atk_cfg = self.cfg["aoe_skill"]
         else:
-            atk_cfg = None
+            # 智能切换（auto）：范围/冷却栏显示**单体**的参数（两种模式的
+            # 参数在 config 里各自独立保存，界面只放得下一套编辑框 ——
+            # 群体的参数要调去配置文件改，够用：出厂值对绝大多数职业适用）。
+            atk_cfg = self.cfg["directional_attack"]
 
         if atk_cfg:
             self.attack_range_x.setText(str(atk_cfg["range_x"]))
@@ -2371,6 +2428,14 @@ class MainWindow(QMainWindow):
         # 仍显式写回一次：旧配置若残留 "stand"，这里顺手纠正，免得引擎按废案跑。
 
     # === Attack Section ===
+        # 🧩 功能开关（2026-10-29 加）：按配置的 features 段纠正勾选态
+        #（缺段/缺键 = 全开 —— 与 feature_enabled 的默认一致）
+        from src.utils.common import feature_enabled as _feat_on
+        for _fname, _l, _t in self.FEATURE_ITEMS:
+            if _fname in getattr(self, "_feature_cbs", {}):
+                self._feature_cbs[_fname].setChecked(
+                    _feat_on(self.cfg, _fname))
+
         atk_cfg = None
         if self.cfg["bot"]["attack"] == "directional":
             self.attack_mode.setCurrentIndex(0)
@@ -2378,6 +2443,10 @@ class MainWindow(QMainWindow):
         elif self.cfg["bot"]["attack"] == "aoe_skill":
             self.attack_mode.setCurrentIndex(1)
             atk_cfg = self.cfg["aoe_skill"]
+        elif self.cfg["bot"]["attack"] == "auto":
+            # 🆕 2026-10-29 智能切换：合法模式，界面编辑框显示单体的参数
+            self.attack_mode.setCurrentIndex(2)
+            atk_cfg = self.cfg["directional_attack"]
         else:
             # 配置里的攻击模式非法（手改配置 / 旧配置残留 / 拼写错误）。
             # 原实现会让 atk_cfg 停在 None，下一行 atk_cfg["range_x"] 直接抛
@@ -3730,6 +3799,12 @@ class MainWindow(QMainWindow):
                 return old
             return v
 
+        # 🧩 功能开关（2026-10-29 加）：勾选态写进 features 段（保存方案时落盘）
+        if getattr(self, "_feature_cbs", None):
+            feats = self.cfg.setdefault("features", {})
+            for _fname, _l, _t in self.FEATURE_ITEMS:
+                feats[_fname] = self._feature_cbs[_fname].isChecked()
+
         if self.attack_mode.currentText() == "基础攻击":
             self.cfg["bot"]["attack"] = "directional"
             self.cfg["key"]["directional_attack"] = _key(
@@ -3746,6 +3821,19 @@ class MainWindow(QMainWindow):
             ao["range_x"] = _num(self.attack_range_x.text(), ao["range_x"], int)
             ao["range_y"] = _num(self.attack_range_y.text(), ao["range_y"], int)
             ao["cooldown"] = _num(self.attack_cooldown.text(), ao["cooldown"], float)
+        elif self.attack_mode.currentText() == "智能切换":
+            # 🆕 2026-10-29：怪多群体、怪少单体。两个键各自保存
+            #（基础攻击键 → 单体技能；群体技能键 → 群体技能），
+            # 界面上的范围/冷却编辑框对应**单体**的参数（与下拉切换时显示一致）。
+            self.cfg["bot"]["attack"] = "auto"
+            self.cfg["key"]["directional_attack"] = _key(
+                self.basic_attack_key, self.cfg["key"].get("directional_attack"))
+            self.cfg["key"]["aoe_skill"] = _key(
+                self.aoe_skill_key, self.cfg["key"].get("aoe_skill"))
+            da = self.cfg["directional_attack"]
+            da["range_x"] = _num(self.attack_range_x.text(), da["range_x"], int)
+            da["range_y"] = _num(self.attack_range_y.text(), da["range_y"], int)
+            da["cooldown"] = _num(self.attack_cooldown.text(), da["cooldown"], float)
         else:
             logger.error(f"[update_cfg_from_main_ui] Unsupported attack mode: {self.cfg['bot']['attack']}")
         # Key binding gbox

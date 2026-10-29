@@ -88,6 +88,9 @@ def test_fire_logic():
 
     def make_kb(pickup):
         kb = KeyBoardController.__new__(KeyBoardController)
+        # 🧩 2026-10-29 功能开关加的：_try_pickup 开头要读 cfg.features
+        #（stub 里不设 features 段 = 功能默认开，与 feature_enabled 的缺省一致）
+        kb.cfg = {}
         kb.pickup_key = pickup
         kb.pickup_cooldown = 2.0
         kb.t_last_pickup = 0.0

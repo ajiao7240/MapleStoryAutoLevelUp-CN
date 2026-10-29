@@ -34,7 +34,10 @@ from src.utils.common import (find_pattern_sqdiff, draw_rectangle, screenshot, n
     resolve_title_bar_height,
     monster_detect_interval, edge_guard_step_cap,
     route_too_narrow_for_patrol,
+    get_game_window_client_origin,
+    feature_enabled,
 )
+from src.input.InterceptionController import mouse_move_to, mouse_hold
 from src.input.KeyBoardController import KeyBoardController, press_key
 from src.input.KeyBoardListener import KeyBoardListener
 from src.input.GameWindowCapturor import GameWindowCapturor
@@ -157,6 +160,9 @@ class MapleStoryAutoBot:
         self.t_last_frame = time.time() # Last frame timer, for fps calculation
         self.t_watch_dog = time.time() # Last movement timer
         self.t_last_attack = time.time() # Last attack timer for cooldown
+        # 🆕 群体技能独立冷却计时器（2026-10-29 加，auto 智能切换用）：
+        # 与单体技能各自独立 —— 游戏里两个技能的冷却本来就是分开转的。
+        self.t_last_attack_aoe = time.time()
         self.t_last_minimap_update = time.time()
         # 运行状态日志（2026-09-12 加）：主循环每 5 秒打一行关键状态。
         # ⚠️ 为什么必须有这一行：主循环原来**一帧不打日志**，于是「点开始、角色不动」
@@ -255,6 +261,9 @@ class MapleStoryAutoBot:
         # Threads & Objects
         self.kb = None # Keyboard controller
         self.capture = None # Game window capturor
+        # 🕵️ 测谎仪守卫（2026-10-29 加）：start() 里创建（要引用 kb）。
+        #    模板不全时 create_guard 返回 None = 功能自动跳过。
+        self.lie_guard = None
 
         # Finite State Machine
         # 国服怀旧服无符文系统（已核实客户端元数据）；巡逻模式已移除，状态机只剩「打怪」一态
@@ -526,9 +535,25 @@ class MapleStoryAutoBot:
                 f"[血蓝监控] 识别过程出错，已停用自动喝药（挂机不受影响）：{e}",
                 exc_info=True)
 
+    # ── 🧩 功能开关（2026-10-29 加，界面「功能开关」勾选框的后端）─────────
+    def feature_on(self, name):
+        '''某项功能此刻是否启用（每帧读配置 → UI 勾选后下一帧生效）。'''
+        return feature_enabled(self.cfg, name)
+
+    def set_feature(self, name, enabled):
+        '''运行中切换功能开关（界面勾选框实时调用，不必停挂机）。
+
+        ⚠️ kb.cfg 与 self.cfg 是**同一个 dict**（KeyBoardController 构造时传的
+           引用）→ 改这里，键盘线程的 buff/拾取门控下一帧就看到；
+           hunting.on_frame 读的也是 self.cfg。所以只需改这一处。
+        '''
+        sec = self.cfg.setdefault("features", {})
+        sec[name] = bool(enabled)
+        logger.info(f"[功能开关] {name} 已{'开启' if enabled else '关闭'}"
+                    f"（下一帧生效，不必重启挂机）")
+
     def set_potion_enabled(self, enabled):
         '''界面/热键切换喝药总开关（2026-09-27 加）。
-
         为什么需要：用户可能想临时手动喝（比如打 BOSS 要自己控药），
         或者发现读数不对想先关掉 —— 不必为此停掉整个挂机。
         '''
@@ -1071,10 +1096,26 @@ class MapleStoryAutoBot:
         self.kb.game_hwnd = getattr(self.capture, "window_hwnd", None)
         logger.info(f"[前台守卫] 游戏窗口句柄 = {self.kb.game_hwnd}")
 
+        # 🕵️ 测谎仪守卫（2026-10-29 加）：挂在 run_once 最高优先级。
+        #    模板没做全 → create_guard 返回 None（日志提示缺什么），不影响其它功能。
+        #    题型是「星星跟随」（目标星越来越透明，鼠标要贴着它移动）——
+        #    守卫只发鼠标移动/按住，坐标是**帧坐标**，由 _lie_move_to 换算成
+        #    屏幕绝对坐标（Interception 的 move_to 只认屏幕坐标）。
+        from src.utils.lie_detector import create_guard, alert_user
+        self.lie_guard = create_guard(self.cfg, hooks={
+            'suppress':   self._lie_suppress,
+            'resume':     self._lie_resume,
+            'move_to':    self._lie_move_to,
+            'hold':       self._lie_hold,
+            'foreground': self.kb.is_game_window_active,
+            'alert':      alert_user,
+        })
+
         # Reset all timers
         self.t_last_frame = time.time()
         self.t_watch_dog = time.time()
         self.t_last_attack = time.time()
+        self.t_last_attack_aoe = time.time()
         self.t_last_minimap_update = time.time()
 
         # Set init state
@@ -1089,6 +1130,35 @@ class MapleStoryAutoBot:
         self.is_first_frame = True
 
         logger.info("[MapleStoryAutoBot] Started")
+
+    # ── 🕵️ 测谎仪守卫的三个钩子（2026-10-29 加）─────────────────────────
+    def _lie_suppress(self):
+        '''守卫进入处理：停掉键盘线程的发键，并松开所有按住的键。
+
+        ⚠️ 必须先置 suppressed 再松键 —— 反过来的话，松键到置位之间
+           键盘线程可能又按出新键（落不到游戏里，还会在测谎弹窗上乱敲）。
+        '''
+        self.kb.suppressed = True
+        self.kb.release_all_key()
+
+    def _lie_resume(self):
+        '''守卫处理完毕（跟随成功 / 弹窗消失）：恢复键盘线程发键。'''
+        self.kb.suppressed = False
+
+    def _lie_move_to(self, x, y):
+        '''跟随用的鼠标移动：帧坐标 → 屏幕绝对坐标。
+
+        每次现取客户区原点（窗口可能被用户挪动）；跟随是高频小步移动，
+        不做 move_to_and_settle 的到位轮询 —— 等到位反而落后于移动中的星星。
+        '''
+        origin = get_game_window_client_origin(self.capture.window_title)
+        if origin is None:
+            return
+        mouse_move_to(origin[0] + int(x), origin[1] + int(y))
+
+    def _lie_hold(self, down):
+        '''跟随期按住/松开左键（config lie_detector.hold_button，默认悬停不按）。'''
+        mouse_hold("left", down)
 
     def pause(self):
         '''
@@ -4368,19 +4438,67 @@ class MapleStoryAutoBot:
             f"指令({self.cmd_move_x} {self.cmd_move_y} {self.cmd_action})"
             + (f"，距上次 {gap:.2f}s" if gap is not None else ""))
 
+    def _attack_mode_now(self):
+        '''本帧该用哪种攻击（2026-10-29 加 auto 智能切换）。
+
+        · bot.attack 是 "directional" / "aoe_skill" → 原样返回（固定模式）；
+        · "auto" → 怪数 ≥ auto_attack.aoe_min_mobs 用群体技能，
+          否则用单体（**用 aoe 的索敌框数出来的怪数**判 —— 见
+          update_cmd_by_mob_detection 里对搜索框的说明）。
+
+        抽成方法：一是 auto 判定集中一处，二是自检可以离线钉住判据。
+        必须在 self.monsters 更新**之后**调用。
+        '''
+        mode = self.cfg["bot"]["attack"]
+        if mode != "auto":
+            return mode
+        try:
+            thr = int((self.cfg.get("auto_attack") or {}).get("aoe_min_mobs", 2))
+        except (TypeError, ValueError):
+            thr = 2
+        return "aoe_skill" if len(self.monsters) >= thr else "directional"
+
+    def _filter_monsters_to_directional_box(self):
+        '''auto 模式选定单体后，把怪列表过滤回**单体的攻击框**内。
+
+        为什么必须过滤：auto 的索敌框取两种模式里更大的那个（aoe 的），
+        用它数怪才能正确决定"该群攻还是单攻"；但单体技能打不了那么远，
+        不过滤的话 350~400px 开外的怪也会被当目标 → 转身对空气出招。
+        过滤判据 = 怪**中心**落在单体的攻击框内（与原版 directional
+        模式的索敌口径一致：position+size/2 vs range+margin）。
+        '''
+        margin = self.cfg["monster_detect"]["search_box_margin"]
+        dx = int(self.cfg["directional_attack"]["range_x"]) + margin
+        dy = int(self.cfg["directional_attack"]["range_y"]) + margin
+        px, py = self.loc_player
+        kept = []
+        for m in self.monsters:
+            mx, my = m["position"]
+            mw, mh = m["size"]
+            cx, cy = mx + mw / 2.0, my + mh / 2.0
+            if abs(cx - px) <= dx and abs(cy - py) <= dy:
+                kept.append(m)
+        if len(kept) != len(self.monsters):
+            logger.debug(f"[auto攻击] {len(self.monsters)} 只怪里 {len(kept)} 只"
+                         "在单体攻击框内（其余在群体框边缘，单体打不着）")
+        self.monsters = kept
+
     def update_cmd_by_mob_detection(self):
         # Get monster search box
         margin = self.cfg["monster_detect"]["search_box_margin"]
-        if self.cfg["bot"]["attack"] == "aoe_skill":
-            dx = self.cfg["aoe_skill"]["range_x"] // 2 + margin
-            dy = self.cfg["aoe_skill"]["range_y"] // 2 + margin
-            cooldown = self.cfg["aoe_skill"]["cooldown"]
-        elif self.cfg["bot"]["attack"] == "directional":
+        mode_cfg = self.cfg["bot"]["attack"]
+        if mode_cfg not in ("aoe_skill", "directional", "auto"):
+            raise RuntimeError(f"Unsupported attack mode: {mode_cfg}")
+        if mode_cfg == "directional":
             dx = self.cfg["directional_attack"]["range_x"] + margin
             dy = self.cfg["directional_attack"]["range_y"] + margin
-            cooldown = self.cfg["directional_attack"]["cooldown"]
         else:
-            raise RuntimeError(f"Unsupported attack mode: {self.cfg['bot']['attack']}")
+            # aoe 固定模式：aoe 框（原行为）。
+            # auto：**也用 aoe 框**（两种模式里更大的那个）—— 数怪必须用
+            #   大框，否则边缘的怪数不到，"该群攻"误判成"单攻"；定下模式
+            #   后再按需过滤回单体的框（见 _filter_monsters_to_directional_box）。
+            dx = self.cfg["aoe_skill"]["range_x"] // 2 + margin
+            dy = self.cfg["aoe_skill"]["range_y"] // 2 + margin
         x0 = max(0                      , self.loc_player[0] - dx)
         x1 = min(self.img_frame.shape[1], self.loc_player[0] + dx)
         y0 = max(0                      , self.loc_player[1] - dy)
@@ -4428,13 +4546,31 @@ class MapleStoryAutoBot:
             # → 用户实测「索敌范围内没有怪还在疯狂打空气」。
             # 上游不发作是因为 update_cmd_by_route 每帧拿路线色码覆盖 cmd_action；
             # 但回正线接不上、或路线走到 goal 时它不会覆盖，这颗雷就会响 —— 所以必须清。
-            if self.cmd_action == "attack":
+            # 2026-10-29：attack_aoe（auto/群体模式的指令）同样要清。
+            if self.cmd_action in ("attack", "attack_aoe"):
                 self.cmd_action = "none"
             return
 
+        # 🆕 auto 智能切换（2026-10-29）：按怪数定本帧的攻击模式。
+        # 注意在「无怪早退」之后 —— 怪数变了（打死了/走远了）模式随时跟着变。
+        mode_now = self._attack_mode_now()
+        if mode_cfg == "auto" and mode_now == "directional":
+            self._filter_monsters_to_directional_box()
+            if len(self.monsters) == 0:
+                # 大框里数得到怪、但都在单体打不着的边缘 —— 站着等它们进圈，
+                # 别朝 400px 外的怪放单体技能（那就是打空气）。
+                if self.cmd_action in ("attack", "attack_aoe"):
+                    self.cmd_action = "none"
+                return
+
         # Update attack command
-        if self.cfg["bot"]["attack"] == "aoe_skill":
-            if time.time() - self.t_last_attack > cooldown:
+        if mode_now == "aoe_skill":
+            cooldown = self.cfg["aoe_skill"]["cooldown"]
+            # ⚠️ 2026-10-29：群体技能用**独立的冷却计时器** t_last_attack_aoe。
+            #   原来与单体共用 t_last_attack —— auto 模式下两技能交替，
+            #   共用会互相卡冷却（放完群体 0.05s 后单体也跟着重置，反之亦然），
+            #   两个技能在游戏里的冷却本来各自独立。
+            if time.time() - self.t_last_attack_aoe > cooldown:
                 # AOE 技能本身不分方向，但仍然要**面向**最近的怪：
                 # 上游在这里完全不设 cmd_move_x，角色永远保持初始朝向，
                 # 用户实测「后方的怪打不到」。AOE 不需要等转身，同帧出招即可。
@@ -4443,10 +4579,14 @@ class MapleStoryAutoBot:
                     face = self.get_face_direction()
                     if face is not None and self.cmd_move_x_last != face:
                         self.cmd_move_x = face
-                self.cmd_action = "attack"
+                self.cmd_action = "attack_aoe"
+                self.t_last_attack_aoe = time.time()
+                # watchdog 的「刚出过招」宽限看 t_last_attack —— 群体出招
+                # 也必须更新它，否则 auto 模式连续群攻会被误判卡死。
                 self.t_last_attack = time.time()
 
-        elif self.cfg["bot"]["attack"] == "directional":
+        elif mode_now == "directional":
+            cooldown = self.cfg["directional_attack"]["cooldown"]
             # Get nearest monster to player
             monster_left  = self.get_nearest_monster(is_left = True)
             monster_right = self.get_nearest_monster(is_left = False)
@@ -4658,6 +4798,26 @@ class MapleStoryAutoBot:
 
         # Grayscale game window
         self.img_frame_gray = cv2.cvtColor(self.img_frame, cv2.COLOR_BGR2GRAY)
+
+        # ── 🕵️ 测谎仪守卫（最高优先级，2026-10-29 加）────────────────────
+        # 弹窗处理中（读题/答题/等结果/等人）时，本帧**跳过一切定位/导航/打怪决策**：
+        #   · 弹窗半透明地盖在画面上，名牌/小地图定位会漂移；
+        #   · 移动/攻击键落到弹窗上是噪音，甚至可能误点弹窗里的按钮；
+        #   · 键盘线程已被守卫抑制（kb.suppressed），指令通道保持空即可。
+        # 守卫自己会发答题的数字键/点击（走同一套 Interception，见 start() 的 hooks）。
+        #
+        # ⚠️ 唯一保留的是**自动喝药**：弹窗不会让怪物停下，低血挂机遇上测谎
+        #    （尤其是转去叫人、等人来答的那几分钟）会活活被打死。喝药走的是
+        #    pageup/home 这类翻页键（见 potion 配置），与答题的数字键互不干扰，
+        #    且 press_potion 自带前台守卫 —— 保留它只赚不赔。
+        if self.lie_guard is not None and \
+                self.lie_guard.step(self.img_frame, time.time()) != 'idle':
+            self.cmd_move_x = 'none'
+            self.cmd_move_y = 'none'
+            self.cmd_action = 'none'
+            self.kb.set_command('none none none')
+            self._step_bars_and_potions(self.img_frame)
+            return 0  # frame done（本帧只服务测谎 + 喝药，其余逻辑全让位）
 
         # Image for debug viz - use the cropped (client area) frame
         if self.is_show_debug_window:

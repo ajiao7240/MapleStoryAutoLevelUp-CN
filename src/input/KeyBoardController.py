@@ -129,6 +129,34 @@ def jump_blocked_msg(n_blocked, dt_since_last, cooldown,
             f"距上次发跳 {dt:.2f}s / 冷却 {cd:.1f}s）{tip}"), float(now)
 
 
+#: bot.attack 的合法取值（2026-10-29 加 "auto" 智能切换）
+VALID_ATTACK_MODES = ("directional", "aoe_skill", "auto")
+
+
+def resolve_attack_keys(cfg):
+    '''从配置解析（单体键, 群体键）（纯函数，可离线单测）。
+
+    · directional → 只填单体键；aoe_skill → 只填群体键（原行为）；
+    · auto（智能切换）→ **两个都填**：怪多时引擎发 "attack_aoe"、
+      怪少发 "attack"，键盘层各按各的键。
+    返回 (attack_key, attack_key_aoe)；两者都为空 = 模式非法，抛 ValueError
+    （与原实现的拒绝语义一致，只是把 auto 放行了）。
+    '''
+    mode = (cfg.get("bot", {}) or {}).get("attack")
+    key_cfg = cfg.get("key", {}) or {}
+    dir_key = aoe_key = ""
+    if mode in ("directional", "auto"):
+        dir_key = key_cfg.get("directional_attack", "") or ""
+    if mode in ("aoe_skill", "auto"):
+        aoe_key = key_cfg.get("aoe_skill", "") or ""
+    if mode not in VALID_ATTACK_MODES:
+        raise ValueError(f"Unexpected attack type: {mode}")
+    if not dir_key and not aoe_key:
+        raise ValueError(f"攻击模式 {mode!r} 下一个可用的攻击键都没有"
+                         f"（检查 key.directional_attack / key.aoe_skill）")
+    return dir_key, aoe_key
+
+
 class KeyBoardController():
     '''
     KeyBoardController - Interception 驱动输入版本
@@ -161,6 +189,13 @@ class KeyBoardController():
         # Flags
         self.is_enable = True
         self.is_terminated = False
+        # 🕵️ 测谎仪应答期间的全局抑制（2026-10-29 加，见 src/utils/lie_detector.py）：
+        #   True = 本线程一个键都不发（方向/攻击/buff/拾取全部静默），
+        #   让测谎守卫独占输入通道答题。进入抑制那一刻守卫会先 release_all_key
+        #   把按住的键松掉（先置 True 再松键，时序保证本线程不会再按新键）。
+        #   ⚠️ 与 is_enable（F1 开关）是两回事：被抑制时 F1 状态不变，
+        #      弹窗处理完守卫自己把它翻回 False，用户无感。
+        self.suppressed = False
         # 游戏窗口句柄：由 AutoBot.start() 在抓到窗口后回填。判"游戏是否在前台"用。
         # 为 None 时退回「标题匹配 + 排除本进程」的弱判据（见 is_game_window_active）。
         self.game_hwnd = None
@@ -199,13 +234,11 @@ class KeyBoardController():
             logger.warning("[KeyBoardController] 请确认已安装 Interception 驱动并重启过电脑")
 
         # set up attack key
-        self.attack_key = ""
-        if cfg["bot"]["attack"] == "aoe_skill":
-            self.attack_key = cfg["key"]["aoe_skill"]
-        elif cfg["bot"]["attack"] == "directional":
-            self.attack_key = cfg["key"]["directional_attack"]
-        else:
-            raise ValueError(f"Unexpected attack type: {cfg['bot']['attack']}")
+        # 🆕 2026-10-29 auto 智能切换：单体/群体**两个键都存**。
+        #   指令层用两个动作名区分：cmd_action == "attack"（单体键）、
+        #   "attack_aoe"（群体键）—— 引擎的 auto 模式按怪数选哪个发。
+        #   解析逻辑抽成了模块级纯函数 resolve_attack_keys（可离线单测）。
+        self.attack_key, self.attack_key_aoe = resolve_attack_keys(cfg)
 
         # Start keyboard control thread
         threading.Thread(target=self.run, daemon=True).start()
@@ -338,6 +371,7 @@ class KeyBoardController():
         key_up("down")
         # Also release attack keys to stop any ongoing attacks
         key_up(self.attack_key)
+        key_up(self.attack_key_aoe)
 
     def _kd(self, key):
         '''按下某键并计数（计数供 [按键状态] 心跳用，见 n_key_sent）。'''
@@ -399,9 +433,14 @@ class KeyBoardController():
 
         行为：
           · pickup 配置留空 → 直接返回，功能关闭（这是默认值）。
+          · 界面「功能开关」取消勾选拾取 → 同样不发键（见开头那道门）。
           · 首次调用只**排期**不按（等一个抖动间隔），避免开局立刻按一下。
           · 时间没到 → 什么都不做（本方法每帧被调，绝大多数帧走这条路）。
         '''
+        # 🧩 功能开关（2026-10-29 加）：界面取消勾选拾取时整段静默
+        from src.utils.common import feature_enabled
+        if not feature_enabled(self.cfg, "pickup"):
+            return
         if not self.pickup_key:
             return
         if self._t_next_pickup <= 0.0:
@@ -443,6 +482,13 @@ class KeyBoardController():
                 self.limit_fps()
                 continue
 
+            # 🕵️ 测谎仪应答期间（suppressed=True）：一个键都不发。
+            #    键已在进入抑制那一刻由守卫松开（见 self.suppressed 的注释）；
+            #    这里只负责"不发新键"，答完题守卫翻回 False 自然恢复。
+            if self.suppressed:
+                self.limit_fps()
+                continue
+
             # 游戏窗口必须在前台：Interception 的按键只会落到**前台窗口**，
             # 游戏不在前台时发键 = 全部打给别人。原实现是静默 continue（连日志都没有），
             # 于是「点开始角色不动」这件事在日志里完全查不到 —— 见 is_game_window_active。
@@ -477,17 +523,19 @@ class KeyBoardController():
             #    绝大多数帧会在内部直接 return（时间没到），开销可忽略。
             self._try_pickup(time.time())
 
-            # Buff skill
-            for i, buff_skill_key in enumerate(self.cfg["buff_skill"]["keys"]):
-                cooldown = self.cfg["buff_skill"]["cooldown"][i]
-                if time.time() - self.t_last_buff_cast[i] >= cooldown and \
-                    time.time() - self.t_last_skill > self.cfg["buff_skill"]["action_cooldown"]:
-                    self._press(buff_skill_key)
-                    logger.info(f"[Buff] Press buff skill key: '{buff_skill_key}' (cooldown: {cooldown}s)")
-                    # Reset timers
-                    self.t_last_buff_cast[i] = time.time()
-                    self.t_last_skill = time.time()
-                    break
+            # 💫 Buff skill（🧩 功能开关：界面取消勾选 buff 时整段静默）
+            from src.utils.common import feature_enabled
+            if feature_enabled(self.cfg, "buff"):
+                for i, buff_skill_key in enumerate(self.cfg["buff_skill"]["keys"]):
+                    cooldown = self.cfg["buff_skill"]["cooldown"][i]
+                    if time.time() - self.t_last_buff_cast[i] >= cooldown and \
+                        time.time() - self.t_last_skill > self.cfg["buff_skill"]["action_cooldown"]:
+                        self._press(buff_skill_key)
+                        logger.info(f"[Buff] Press buff skill key: '{buff_skill_key}' (cooldown: {cooldown}s)")
+                        # Reset timers
+                        self.t_last_buff_cast[i] = time.time()
+                        self.t_last_skill = time.time()
+                        break
 
             ##########################
             ### Left-Right Command ###
@@ -585,6 +633,11 @@ class KeyBoardController():
                 self._press(self.cfg["key"]["teleport"])
             elif self.cmd_action == "attack":
                 self._press(self.attack_key)
+                self.t_last_skill = time.time()
+            elif self.cmd_action == "attack_aoe":
+                # 🆕 群体技能键（2026-10-29 auto 智能切换）：
+                # 怪多时引擎发这个动作，按群体技能键。
+                self._press(self.attack_key_aoe)
                 self.t_last_skill = time.time()
             elif self.cmd_action == "goal":
                 pass
